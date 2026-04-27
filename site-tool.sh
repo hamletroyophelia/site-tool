@@ -7,9 +7,8 @@ TARGET_BIN="/usr/local/bin/siteadd"
 NGINX_CONF="/etc/nginx/nginx.conf"
 CONF_DIR="/etc/nginx/conf.d"
 SSL_BASE="/etc/nginx/ssl"
-ACME_BIN="$HOME/.acme.sh/acme.sh"
 
-# 如果用 root 执行,HOME 通常是 /root
+ACME_BIN="$HOME/.acme.sh/acme.sh"
 if [ "$(id -u)" -eq 0 ]; then
   ACME_BIN="/root/.acme.sh/acme.sh"
 fi
@@ -24,6 +23,20 @@ check_root() {
 pause() {
   echo
   read -rp "按回车返回菜单..."
+}
+
+ensure_deps() {
+  local need_install=0
+
+  command -v curl >/dev/null 2>&1 || need_install=1
+  command -v dig >/dev/null 2>&1 || need_install=1
+  command -v python3 >/dev/null 2>&1 || need_install=1
+
+  if [ "$need_install" -eq 1 ]; then
+    echo "检测到缺少基础依赖,正在安装 curl dnsutils python3..."
+    apt update
+    apt install -y curl dnsutils python3
+  fi
 }
 
 normalize_domain() {
@@ -123,36 +136,6 @@ check_dns() {
   fi
 }
 
-create_http_redirect_block() {
-  local domain="$1"
-
-  cat <<NGINX
-server {
-    listen 80;
-    listen [::]:80;
-    server_name $domain;
-
-    location ^~ /.well-known/acme-challenge/ {
-        root /usr/share/nginx/html;
-        default_type "text/plain";
-        try_files \$uri =404;
-    }
-
-    return 301 https://\$host\$request_uri;
-}
-NGINX
-}
-
-confirm_overwrite() {
-  local file="$1"
-
-  if [ -f "$file" ]; then
-    echo "检测到配置文件已存在: $file"
-    read -rp "是否覆盖? 输入 y 覆盖: " overwrite
-    [[ "$overwrite" =~ ^[Yy]$ ]] || exit 1
-  fi
-}
-
 ensure_acme() {
   if [ ! -x "$ACME_BIN" ]; then
     echo "没有找到 acme.sh: $ACME_BIN"
@@ -212,6 +195,36 @@ issue_cert() {
     --reloadcmd "systemctl reload nginx"
 
   echo "证书已安装到: $ssl_dir"
+}
+
+create_http_redirect_block() {
+  local domain="$1"
+
+  cat <<NGINX
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $domain;
+
+    location ^~ /.well-known/acme-challenge/ {
+        root /usr/share/nginx/html;
+        default_type "text/plain";
+        try_files \$uri =404;
+    }
+
+    return 301 https://\$host\$request_uri;
+}
+NGINX
+}
+
+confirm_overwrite() {
+  local file="$1"
+
+  if [ -f "$file" ]; then
+    echo "检测到配置文件已存在: $file"
+    read -rp "是否覆盖? 输入 y 覆盖: " overwrite
+    [[ "$overwrite" =~ ^[Yy]$ ]] || exit 1
+  fi
 }
 
 add_stream_map() {
@@ -291,7 +304,7 @@ new_lines = []
 removed = 0
 
 for line in lines:
-    if domain in line and "nginx_https" in line:
+    if domain in line and ("nginx_https" in line or "xray" in line):
         removed += 1
         continue
     new_lines.append(line)
@@ -304,6 +317,22 @@ if removed:
 else:
     print(f"没有在 stream map 找到 {domain},跳过。")
 PY
+}
+
+ssl_proxy_part() {
+  local upstream="$1"
+  local upstream_host
+  local upstream_scheme
+
+  upstream_host="$(get_host_from_url "$upstream")"
+  upstream_scheme="$(get_scheme_from_url "$upstream")"
+
+  if [ "$upstream_scheme" = "https" ]; then
+    cat <<NGINX
+        proxy_ssl_server_name on;
+        proxy_ssl_name $upstream_host;
+NGINX
+  fi
 }
 
 create_proxy_common_headers() {
@@ -323,22 +352,6 @@ create_proxy_common_headers() {
         proxy_send_timeout 3600s;
         proxy_read_timeout 3600s;
 NGINX
-}
-
-ssl_proxy_part() {
-  local upstream="$1"
-  local upstream_host
-  local upstream_scheme
-
-  upstream_host="$(get_host_from_url "$upstream")"
-  upstream_scheme="$(get_scheme_from_url "$upstream")"
-
-  if [ "$upstream_scheme" = "https" ]; then
-    cat <<NGINX
-        proxy_ssl_server_name on;
-        proxy_ssl_name $upstream_host;
-NGINX
-  fi
 }
 
 add_emby_proxy() {
@@ -505,7 +518,7 @@ server {
 
     client_max_body_size 0;
 
-    # Emby 推流、播放、下载相关路径
+    # Emby 推流、播放、下载、大流量路径
     location ~* ^/(emby/)?(Videos|Audio|Items/.*/(PlaybackInfo|Download)|LiveTv|Sync|Sessions/Playing) {
         proxy_pass $stream_upstream;
 $(ssl_proxy_part "$stream_upstream")
@@ -854,6 +867,81 @@ NGINX
   echo "PHP 网站目录: $webroot"
 }
 
+scan_existing_configs() {
+  clear
+  echo "======================================"
+  echo " 扫描现有 Nginx / 证书配置"
+  echo "======================================"
+  echo
+
+  printf "%-28s %-12s %-32s %-42s %-8s %-8s\n" "域名" "类型" "配置文件" "后端/目录" "证书" "Stream"
+  printf "%-28s %-12s %-32s %-42s %-8s %-8s\n" "----------------------------" "------------" "--------------------------------" "------------------------------------------" "--------" "--------"
+
+  for conf in "$CONF_DIR"/*.conf; do
+    [ -f "$conf" ] || continue
+
+    domains="$(grep -E '^\s*server_name\s+' "$conf" | sed -E 's/^\s*server_name\s+//;s/;//' | tr ' ' '\n' | grep -v '^$' | sort -u)"
+
+    for domain in $domains; do
+      [ "$domain" = "_" ] && continue
+
+      type="未知"
+      backend="-"
+
+      if grep -q "fastcgi_pass" "$conf"; then
+        type="PHP网站"
+        root_path="$(grep -E '^\s*root\s+' "$conf" | head -1 | sed -E 's/^\s*root\s+//;s/;//')"
+        php_fpm="$(grep -E '^\s*fastcgi_pass\s+' "$conf" | head -1 | sed -E 's/^\s*fastcgi_pass\s+//;s/;//')"
+        backend="${root_path} -> ${php_fpm}"
+      elif grep -q "proxy_pass" "$conf"; then
+        if grep -qiE "PlaybackInfo|Download|LiveTv|Sessions/Playing" "$conf"; then
+          type="Emby分离"
+        elif grep -qi "emby" "$conf"; then
+          type="Emby反代"
+        else
+          type="普通反代"
+        fi
+        backend="$(grep -E '^\s*proxy_pass\s+' "$conf" | head -2 | sed -E 's/^\s*proxy_pass\s+//;s/;//' | paste -sd ',' -)"
+      elif grep -q "try_files" "$conf" && grep -q "root" "$conf"; then
+        type="静态网站"
+        backend="$(grep -E '^\s*root\s+' "$conf" | head -1 | sed -E 's/^\s*root\s+//;s/;//')"
+      elif grep -q "return 301" "$conf"; then
+        type="跳转/伪装"
+        backend="$(grep -E '^\s*return\s+' "$conf" | head -1 | sed -E 's/^\s*return\s+//;s/;//')"
+      fi
+
+      cert="无"
+      if [ -f "${SSL_BASE}/${domain}/fullchain.pem" ] || [ -f "${SSL_BASE}/${domain}/privkey.pem" ]; then
+        cert="有"
+      elif grep -q "ssl_certificate" "$conf"; then
+        cert="引用"
+      fi
+
+      stream="无"
+      if grep -F "$domain" "$NGINX_CONF" 2>/dev/null | grep -q "nginx_https"; then
+        stream="有"
+      elif grep -F "$domain" "$NGINX_CONF" 2>/dev/null | grep -q "xray"; then
+        stream="Xray"
+      fi
+
+      short_conf="$(basename "$conf")"
+      printf "%-28s %-12s %-32s %-42s %-8s %-8s\n" "$domain" "$type" "$short_conf" "${backend:0:42}" "$cert" "$stream"
+    done
+  done
+
+  echo
+  echo "====== acme.sh 证书列表 ======"
+  if [ -x "$ACME_BIN" ]; then
+    "$ACME_BIN" --list || true
+  else
+    echo "未找到 acme.sh: $ACME_BIN"
+  fi
+
+  echo
+  echo "====== /etc/nginx/ssl 证书目录 ======"
+  ls -1 "$SSL_BASE" 2>/dev/null || echo "没有找到 $SSL_BASE"
+}
+
 list_sites() {
   clear
   echo "======================================"
@@ -865,12 +953,14 @@ list_sites() {
   ls -1 "$CONF_DIR"/*.conf 2>/dev/null | sed 's#^#  #' || echo "  没有找到 .conf 文件"
 
   echo
-  echo "Stream map 中的 nginx_https 域名:"
-  grep -E 'nginx_https;' "$NGINX_CONF" 2>/dev/null | sed 's#^#  #' || echo "  没有找到 nginx_https 记录"
+  echo "Stream map 中的 nginx_https / xray 域名:"
+  grep -E 'nginx_https;|xray;' "$NGINX_CONF" 2>/dev/null | sed 's#^#  #' || echo "  没有找到记录"
 }
 
 delete_site_config() {
   check_root
+
+  local force_delete_cert="${1:-no}"
 
   clear
   echo "======================================"
@@ -889,17 +979,24 @@ delete_site_config() {
   local conf_file="${CONF_DIR}/${domain}.conf"
   local ssl_dir="${SSL_BASE}/${domain}"
   local backup
+  local del_cert=""
 
   echo
   echo "将删除:"
   echo "Nginx 配置: $conf_file"
-  echo "Stream map: $domain nginx_https"
-  echo
-  echo "证书目录是否删除:"
-  echo "$ssl_dir"
+  echo "Stream map: $domain"
   echo
 
-  read -rp "是否同时删除证书? 输入 y 删除证书,直接回车保留: " del_cert
+  if [ "$force_delete_cert" = "yes" ]; then
+    del_cert="y"
+    echo "证书也会一起删除:"
+    echo "$ssl_dir"
+  else
+    echo "证书目录:"
+    echo "$ssl_dir"
+    read -rp "是否同时删除证书? 输入 y 删除证书,直接回车保留: " del_cert
+  fi
+
   echo
   read -rp "确认删除站点 $domain ? 输入 DELETE 继续: " confirm
 
@@ -1004,331 +1101,3 @@ cert_issue_menu() {
 
 cert_list() {
   clear
-  echo "======================================"
-  echo " acme.sh 证书列表"
-  echo "======================================"
-  echo
-
-  if [ -x "$ACME_BIN" ]; then
-    "$ACME_BIN" --list || true
-  else
-    echo "没有找到 acme.sh: $ACME_BIN"
-  fi
-
-  echo
-  echo "/etc/nginx/ssl 目录:"
-  ls -la "$SSL_BASE" 2>/dev/null || true
-}
-
-cert_renew_all() {
-  check_root
-
-  clear
-  echo "======================================"
-  echo " 续签全部证书"
-  echo "======================================"
-  echo
-
-  ensure_acme
-  "$ACME_BIN" --renew-all --ecc || true
-
-  echo
-  echo "续签命令已执行。"
-  echo "建议检查:"
-  echo "nginx -t"
-}
-
-nginx_test() {
-  clear
-  nginx -t
-}
-
-nginx_reload() {
-  check_root
-  nginx -t
-  systemctl reload nginx
-  echo "Nginx 已重载。"
-}
-
-nginx_restart() {
-  check_root
-  nginx -t
-  systemctl restart nginx
-  echo "Nginx 已重启。"
-}
-
-nginx_logs() {
-  clear
-  echo "======================================"
-  echo " Nginx 错误日志"
-  echo "======================================"
-  echo
-  tail -80 /var/log/nginx/error.log 2>/dev/null || echo "没有找到 /var/log/nginx/error.log"
-}
-
-nginx_stream_logs() {
-  clear
-  echo "======================================"
-  echo " Nginx Stream 日志"
-  echo "======================================"
-  echo
-  tail -80 /var/log/nginx/stream.log 2>/dev/null || echo "没有找到 /var/log/nginx/stream.log"
-}
-
-manual_backup() {
-  check_root
-
-  local backup
-  backup="$(backup_nginx "manual")"
-  echo "已备份到: $backup"
-}
-
-rollback_latest_backup() {
-  check_root
-
-  clear
-  echo "======================================"
-  echo " 回滚最近一次 Nginx 备份"
-  echo "======================================"
-  echo
-
-  local latest
-  latest="$(ls -1t /root/nginx-backup-*.tar.gz 2>/dev/null | head -1 || true)"
-
-  if [ -z "$latest" ]; then
-    echo "没有找到备份文件。"
-    return
-  fi
-
-  echo "最近备份:"
-  echo "$latest"
-  echo
-
-  read -rp "确认回滚? 输入 ROLLBACK 继续: " confirm
-
-  if [ "$confirm" != "ROLLBACK" ]; then
-    echo "已取消。"
-    return
-  fi
-
-  restore_nginx_backup "$latest"
-
-  echo
-  echo "测试回滚后的配置:"
-  nginx -t
-
-  read -rp "是否重载 Nginx? 输入 y 重载: " ok
-  if [[ "$ok" =~ ^[Yy]$ ]]; then
-    systemctl reload nginx
-    echo "Nginx 已重载。"
-  fi
-}
-
-uninstall_self() {
-  check_root
-
-  clear
-  echo "======================================"
-  echo " 卸载 siteadd 工具"
-  echo "======================================"
-  echo
-
-  echo "即将删除:"
-  echo "安装目录: $INSTALL_DIR"
-  echo "命令链接: $TARGET_BIN"
-  echo
-  echo "不会删除:"
-  echo "/etc/nginx"
-  echo "/etc/nginx/ssl"
-  echo "已经创建的网站配置"
-  echo
-
-  read -rp "确认卸载工具? 输入 DELETE 继续: " ok
-
-  if [ "$ok" != "DELETE" ]; then
-    echo "已取消。"
-    return
-  fi
-
-  rm -f "$TARGET_BIN"
-  rm -rf "$INSTALL_DIR"
-
-  echo
-  echo "siteadd 工具已卸载。"
-  exit 0
-}
-
-website_menu() {
-  while true; do
-    clear
-    echo "======================================"
-    echo " 网站添加"
-    echo "======================================"
-    echo
-    echo "1. 添加普通网站反代"
-    echo "2. 添加静态网站"
-    echo "3. 添加 PHP 网站"
-    echo "0. 返回"
-    echo
-    read -rp "请选择: " choice
-
-    case "$choice" in
-      1) add_normal_proxy; pause ;;
-      2) add_static_site; pause ;;
-      3) add_php_site; pause ;;
-      0) return ;;
-      *) echo "无效选择"; sleep 1 ;;
-    esac
-  done
-}
-
-emby_menu() {
-  while true; do
-    clear
-    echo "======================================"
-    echo " Emby 反代"
-    echo "======================================"
-    echo
-    echo "1. 添加 Emby 普通反代"
-    echo "2. 添加 Emby 前后端分离反代"
-    echo "0. 返回"
-    echo
-    read -rp "请选择: " choice
-
-    case "$choice" in
-      1) add_emby_proxy; pause ;;
-      2) add_emby_split_proxy; pause ;;
-      0) return ;;
-      *) echo "无效选择"; sleep 1 ;;
-    esac
-  done
-}
-
-config_menu() {
-  while true; do
-    clear
-    echo "======================================"
-    echo " 配置管理"
-    echo "======================================"
-    echo
-    echo "1. 查看现有站点配置"
-    echo "2. 删除站点配置"
-    echo "3. 删除站点配置 + 证书"
-    echo "4. 仅删除证书"
-    echo "0. 返回"
-    echo
-    read -rp "请选择: " choice
-
-    case "$choice" in
-      1) list_sites; pause ;;
-      2)
-        # 删除站点配置时,函数里会问是否删除证书
-        delete_site_config
-        pause
-        ;;
-      3)
-        echo
-        echo "提示: 下一步选择删除站点时,请在“是否同时删除证书”处输入 y。"
-        pause
-        delete_site_config
-        pause
-        ;;
-      4) delete_cert_only; pause ;;
-      0) return ;;
-      *) echo "无效选择"; sleep 1 ;;
-    esac
-  done
-}
-
-cert_menu() {
-  while true; do
-    clear
-    echo "======================================"
-    echo " 证书管理"
-    echo "======================================"
-    echo
-    echo "1. 申请/重装某个域名证书"
-    echo "2. 查看证书列表"
-    echo "3. 续签全部证书"
-    echo "4. 删除某个域名证书"
-    echo "0. 返回"
-    echo
-    read -rp "请选择: " choice
-
-    case "$choice" in
-      1) cert_issue_menu; pause ;;
-      2) cert_list; pause ;;
-      3) cert_renew_all; pause ;;
-      4) delete_cert_only; pause ;;
-      0) return ;;
-      *) echo "无效选择"; sleep 1 ;;
-    esac
-  done
-}
-
-nginx_menu() {
-  while true; do
-    clear
-    echo "======================================"
-    echo " Nginx 管理"
-    echo "======================================"
-    echo
-    echo "1. 测试配置 nginx -t"
-    echo "2. 重载 Nginx"
-    echo "3. 重启 Nginx"
-    echo "4. 查看 error.log"
-    echo "5. 查看 stream.log"
-    echo "6. 手动备份 /etc/nginx"
-    echo "7. 回滚最近一次备份"
-    echo "0. 返回"
-    echo
-    read -rp "请选择: " choice
-
-    case "$choice" in
-      1) nginx_test; pause ;;
-      2) nginx_reload; pause ;;
-      3) nginx_restart; pause ;;
-      4) nginx_logs; pause ;;
-      5) nginx_stream_logs; pause ;;
-      6) manual_backup; pause ;;
-      7) rollback_latest_backup; pause ;;
-      0) return ;;
-      *) echo "无效选择"; sleep 1 ;;
-    esac
-  done
-}
-
-main_menu() {
-  check_root
-
-  while true; do
-    clear
-    echo "======================================"
-    echo " siteadd 网站/Nginx 管理工具"
-    echo " 适用于 Nginx Stream SNI 分流架构"
-    echo "======================================"
-    echo
-    echo "1. 网站添加"
-    echo "2. Emby 反代"
-    echo "3. 配置管理"
-    echo "4. 证书管理"
-    echo "5. Nginx 管理"
-    echo "6. 卸载 siteadd 工具"
-    echo "0. 退出"
-    echo
-    read -rp "请选择: " choice
-
-    case "$choice" in
-      1) website_menu ;;
-      2) emby_menu ;;
-      3) config_menu ;;
-      4) cert_menu ;;
-      5) nginx_menu ;;
-      6) uninstall_self ;;
-      0) echo "已退出。"; exit 0 ;;
-      *) echo "无效选择。"; sleep 1 ;;
-    esac
-  done
-}
-
-main_menu
