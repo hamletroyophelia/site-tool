@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 set -e
 
-INSTALL_DIR="/opt/emby-tool"
-TARGET_BIN="/usr/local/bin/embyadd"
+INSTALL_DIR="/opt/site-tool"
+TARGET_BIN="/usr/local/bin/siteadd"
 
-REPO_RAW="https://raw.githubusercontent.com/你的用户名/emby-tool/main"
-MAIN_SCRIPT_URL="$REPO_RAW/add-emby-domain.sh"
+REPO_RAW="https://raw.githubusercontent.com/hamletroyophelia/site-tool/main"
+MAIN_SCRIPT_URL="$REPO_RAW/site-tool.sh"
 
 echo "======================================"
-echo " Emby 反代域名工具安装器"
+echo " 网站/Nginx 反代工具安装器"
 echo "======================================"
+echo
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "请用 root 用户运行"
@@ -19,15 +20,17 @@ fi
 mkdir -p "$INSTALL_DIR"
 
 echo "正在下载主脚本..."
-curl -fsSL "$MAIN_SCRIPT_URL" -o "$INSTALL_DIR/add-emby-domain.sh"
+curl -fsSL "$MAIN_SCRIPT_URL" -o "$INSTALL_DIR/site-tool.sh"
 
-chmod +x "$INSTALL_DIR/add-emby-domain.sh"
+chmod +x "$INSTALL_DIR/site-tool.sh"
 
-echo "正在安装命令: embyadd"
-ln -sf "$INSTALL_DIR/add-emby-domain.sh" "$TARGET_BIN"
+echo "正在安装命令: siteadd"
+ln -sf "$INSTALL_DIR/site-tool.sh" "$TARGET_BIN"
 chmod +x "$TARGET_BIN"
 
 echo
 echo "安装完成!"
+echo
 echo "以后直接输入:"
-echo "  embyadd"
+echo "  siteadd"
+echo
