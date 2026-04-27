@@ -8,7 +8,7 @@ REPO_RAW="https://raw.githubusercontent.com/hamletroyophelia/site-tool/main"
 MAIN_SCRIPT_URL="$REPO_RAW/site-tool.sh"
 
 echo "======================================"
-echo " 网站/Nginx 反代工具安装器"
+echo " 网站/Nginx 管理工具安装器"
 echo "======================================"
 echo
 
