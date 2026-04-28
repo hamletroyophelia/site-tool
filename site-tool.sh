@@ -323,8 +323,8 @@ add_emby_proxy() {
   echo " 添加 Emby 普通反代"
   echo "========"
   echo
-  read -rp "请输入反代域名,例如 emby2.254252.xyz: " domain
-  read -rp "请输入 Emby 源站地址,例如 https://iris.niceduck.lol: " upstream
+  read -rp "请输入反代域名: " domain
+  read -rp "请输入 Emby 源站地址: " upstream
   domain="$(normalize_domain "$domain")"
   upstream="$(normalize_url "$upstream")"
   if [ -z "$domain" ] || [ -z "$upstream" ]; then
@@ -389,7 +389,7 @@ add_emby_split_proxy() {
   echo " 添加 Emby 前后端分离反代"
   echo "========"
   echo
-  read -rp "请输入反代域名,例如 emby.254252.xyz: " domain
+  read -rp "请输入反代域名 " domain
   read -rp "请输入主后端地址,例如 https://main.example.com: " main_upstream
   read -rp "请输入推流后端地址,例如 https://stream.example.com: " stream_upstream
   domain="$(normalize_domain "$domain")"
@@ -476,8 +476,8 @@ add_normal_proxy() {
   echo " 添加普通网站反代"
   echo "========"
   echo
-  read -rp "请输入网站域名,例如 app.254252.xyz: " domain
-  read -rp "请输入后端地址,例如 http://127.0.0.1:3000: " upstream
+  read -rp "请输入网站域名: " domain
+  read -rp "请输入后端地址: " upstream
   domain="$(normalize_domain "$domain")"
   upstream="$(normalize_url "$upstream")"
   if [ -z "$domain" ] || [ -z "$upstream" ]; then
